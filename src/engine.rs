@@ -4,7 +4,7 @@ use std::{
     future::Future,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Weak,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -16,9 +16,40 @@ use crate::{
     compression,
     config::EngramBuilder,
     memory::{self, MemoryEntry},
-    storage::SqliteStore,
+    storage::{SqliteStore, StoredWrite},
     Compression, Error, Result,
 };
+
+/// The tier that satisfied a cache read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CacheTier {
+    Memory,
+    Persistent,
+}
+
+/// Expiration and source information for a cached value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CacheMetadata {
+    /// `None` means the value does not expire automatically.
+    pub expires_at: Option<SystemTime>,
+    /// The tier in which the entry was found for this lookup.
+    pub tier: CacheTier,
+}
+
+impl CacheMetadata {
+    /// Returns the remaining TTL. `None` means the entry is non-expiring.
+    pub fn remaining_ttl(&self) -> Option<Duration> {
+        self.expires_at
+            .and_then(|expires_at| expires_at.duration_since(SystemTime::now()).ok())
+    }
+}
+
+/// A cached value returned together with its metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CacheEntry<T> {
+    pub value: T,
+    pub metadata: CacheMetadata,
+}
 
 /// A reusable asynchronous cache with Moka memory and SQLite persistence tiers.
 /// `Engram` is cheap to clone; clones share memory, persistence, and synchronization.
@@ -27,15 +58,24 @@ pub struct Engram {
     memory: memory::Memory,
     storage: Arc<SqliteStore>,
     compression: Compression,
-    // Prevents L2 reads from promoting an entry while it is being invalidated.
-    gate: Arc<RwLock<()>>,
-    // Used only by the optional fetch-through helper.
+    compression_threshold: usize,
+    compress_only_if_smaller: bool,
+    // `clear` takes this write lock; all other operations take a shared lock.
+    clear_gate: Arc<RwLock<()>>,
+    // Operations on the same key serialize, while unrelated keys proceed concurrently.
+    key_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     in_flight: Arc<Mutex<HashMap<String, Arc<Flight>>>>,
 }
 
 struct Flight {
     notify: Arc<Notify>,
     completed: AtomicBool,
+}
+
+struct PendingWrite {
+    write: StoredWrite,
+    value: Arc<dyn Any + Send + Sync>,
+    expires_at: Option<SystemTime>,
 }
 
 impl Engram {
@@ -45,97 +85,194 @@ impl Engram {
     }
 
     pub(crate) async fn from_builder(config: EngramBuilder) -> Result<Self> {
+        let storage = Arc::new(
+            SqliteStore::open(
+                &config.storage,
+                config.sqlite_connections,
+                config.sqlite_synchronous,
+            )
+            .await?,
+        );
+        let clear_gate = Arc::new(RwLock::new(()));
+        if let Some(interval) = config.cleanup_interval {
+            spawn_expiry_cleaner(
+                Arc::downgrade(&storage),
+                Arc::downgrade(&clear_gate),
+                interval,
+            );
+        }
         Ok(Self {
             memory: memory::new(config.memory_capacity),
-            storage: Arc::new(SqliteStore::open(&config.storage, config.sqlite_connections).await?),
+            storage,
             compression: config.compression,
-            gate: Arc::new(RwLock::new(())),
+            compression_threshold: config.compression_threshold,
+            compress_only_if_smaller: config.compress_only_if_smaller,
+            clear_gate,
+            key_locks: Arc::new(Mutex::new(HashMap::new())),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     /// Retrieves a value, checking Moka before SQLite.
-    ///
-    /// A missing or expired entry returns `Ok(None)`. The `Clone` bound lets L1 keep
-    /// a deserialized owned value while returning an owned value to the caller.
     pub async fn get<T>(&self, key: impl AsRef<str>) -> Result<Option<T>>
     where
         T: DeserializeOwned + Clone + Send + Sync + 'static,
     {
-        let key = key.as_ref();
-        let _guard = self.gate.read().await;
+        Ok(self
+            .get_arc_with_metadata::<T>(key.as_ref())
+            .await?
+            .map(|(value, _)| (*value).clone()))
+    }
 
+    /// Retrieves a value with expiration/source metadata.
+    pub async fn get_with_metadata<T>(&self, key: impl AsRef<str>) -> Result<Option<CacheEntry<T>>>
+    where
+        T: DeserializeOwned + Clone + Send + Sync + 'static,
+    {
+        Ok(self
+            .get_arc_with_metadata::<T>(key.as_ref())
+            .await?
+            .map(|(value, metadata)| CacheEntry {
+                value: (*value).clone(),
+                metadata,
+            }))
+    }
+
+    /// Retrieves a shared L1 value without cloning it. This is useful for large values.
+    pub async fn get_arc<T>(&self, key: impl AsRef<str>) -> Result<Option<Arc<T>>>
+    where
+        T: DeserializeOwned + Send + Sync + 'static,
+    {
+        Ok(self
+            .get_arc_with_metadata::<T>(key.as_ref())
+            .await?
+            .map(|(value, _)| value))
+    }
+
+    /// Returns expiry and source information without deserializing an L2 value.
+    pub async fn metadata(&self, key: impl AsRef<str>) -> Result<Option<CacheMetadata>> {
+        let key = key.as_ref();
+        let _clear_guard = self.clear_gate.read().await;
+        let key_lock = self.key_lock(key).await;
+        let _key_guard = key_lock.lock().await;
         if let Some(entry) = self.memory.get(key).await {
             if !expired(entry.expires_at) {
-                return downcast_value(key, entry.value, entry.type_name);
+                return Ok(Some(CacheMetadata {
+                    expires_at: entry.expires_at,
+                    tier: CacheTier::Memory,
+                }));
             }
             self.memory.invalidate(key).await;
         }
-
-        let Some(stored) = self.storage.get(key).await? else {
+        let Some(expires_at_ms) = self.storage.metadata(key).await? else {
             return Ok(None);
         };
-        if expired_ms(stored.expires_at_ms) {
+        if expired_ms(expires_at_ms) {
             self.storage.remove(key).await?;
             return Ok(None);
         }
-        if stored.type_name != type_name::<T>() {
-            return Err(Error::TypeMismatch {
-                key: key.to_owned(),
-                requested: type_name::<T>(),
-                actual: stored.type_name,
-            });
-        }
-
-        let bytes = compression::decode(stored.bytes, stored.encoding).await?;
-        let value: T = bincode::deserialize(&bytes).map_err(Error::Deserialize)?;
-        let entry = Arc::new(MemoryEntry {
-            value: Arc::new(value.clone()),
-            type_name: type_name::<T>(),
-            expires_at: stored.expires_at_ms.map(system_time_from_ms),
-            weight: cache_weight(bytes.len()),
-        });
-        self.memory.insert(key.to_owned(), entry).await;
-        Ok(Some(value))
+        Ok(Some(CacheMetadata {
+            expires_at: expires_at_ms.map(system_time_from_ms),
+            tier: CacheTier::Persistent,
+        }))
     }
 
-    /// Stores a value in both tiers.
-    ///
-    /// SQLite write failures remove the new L1 value and are returned to the caller.
-    /// A successful call therefore always represents persisted data.
+    /// Stores a value in both tiers using serialized byte length as its L1 weight.
     pub async fn set<T>(&self, key: impl AsRef<str>, value: &T, ttl: Option<Duration>) -> Result<()>
     where
         T: Serialize + Clone + Send + Sync + 'static,
     {
-        let key = key.as_ref().to_owned();
-        let serialized = bincode::serialize(value).map_err(Error::Serialize)?;
-        let weight = cache_weight(serialized.len());
-        let (compressed, encoding) = compression::encode(serialized, &self.compression).await?;
-        let expires_at = ttl.map(|ttl| SystemTime::now() + ttl);
-        let expires_at_ms = expires_at.map(system_time_ms);
-        let now_ms = system_time_ms(SystemTime::now());
-        let entry = Arc::new(MemoryEntry {
-            value: Arc::new(value.clone()),
-            type_name: type_name::<T>(),
-            expires_at,
-            weight,
-        });
+        self.set_arc(key, Arc::new(value.clone()), ttl).await
+    }
 
-        let _guard = self.gate.write().await;
-        self.memory.insert(key.clone(), entry).await;
-        if let Err(error) = self
-            .storage
-            .set(
-                &key,
-                &compressed,
-                expires_at_ms,
-                encoding,
-                type_name::<T>(),
-                now_ms,
-            )
+    /// Stores a shared value without cloning it for L1.
+    pub async fn set_arc<T>(
+        &self,
+        key: impl AsRef<str>,
+        value: Arc<T>,
+        ttl: Option<Duration>,
+    ) -> Result<()>
+    where
+        T: Serialize + Send + Sync + 'static,
+    {
+        self.set_arc_inner(key.as_ref().to_owned(), value, ttl, None)
             .await
-        {
-            self.memory.invalidate(&key).await;
+    }
+
+    /// Stores a value with an explicit L1 weight, useful when serialized size is not
+    /// representative of its in-memory footprint.
+    pub async fn set_with_weight<T>(
+        &self,
+        key: impl AsRef<str>,
+        value: &T,
+        ttl: Option<Duration>,
+        weight: u32,
+    ) -> Result<()>
+    where
+        T: Serialize + Clone + Send + Sync + 'static,
+    {
+        self.set_arc_inner(
+            key.as_ref().to_owned(),
+            Arc::new(value.clone()),
+            ttl,
+            Some(weight),
+        )
+        .await
+    }
+
+    /// Stores an `Arc` with an explicit L1 weight.
+    pub async fn set_arc_with_weight<T>(
+        &self,
+        key: impl AsRef<str>,
+        value: Arc<T>,
+        ttl: Option<Duration>,
+        weight: u32,
+    ) -> Result<()>
+    where
+        T: Serialize + Send + Sync + 'static,
+    {
+        self.set_arc_inner(key.as_ref().to_owned(), value, ttl, Some(weight))
+            .await
+    }
+
+    /// Persists many values in one SQLite transaction.
+    pub async fn set_many<T, I, K>(&self, values: I, ttl: Option<Duration>) -> Result<()>
+    where
+        T: Serialize + Send + Sync + 'static,
+        I: IntoIterator<Item = (K, T)>,
+        K: Into<String>,
+    {
+        let mut pending = Vec::new();
+        for (key, value) in values {
+            pending.push(
+                self.prepare_write(key.into(), Arc::new(value), ttl, None)
+                    .await?,
+            );
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let _clear_guard = self.clear_gate.read().await;
+        let mut keys: Vec<String> = pending
+            .iter()
+            .map(|pending| pending.write.key.clone())
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let mut _key_guards = Vec::with_capacity(keys.len());
+        for key in &keys {
+            _key_guards.push(self.key_lock(key).await.lock_owned().await);
+        }
+
+        for pending_write in &pending {
+            self.insert_memory(pending_write).await;
+        }
+        let writes: Vec<StoredWrite> = pending.into_iter().map(|pending| pending.write).collect();
+        if let Err(error) = self.storage.set_many(&writes).await {
+            for key in &keys {
+                self.memory.invalidate(key).await;
+            }
             return Err(error);
         }
         Ok(())
@@ -144,25 +281,24 @@ impl Engram {
     /// Removes a key from both memory and persistent storage.
     pub async fn remove(&self, key: impl AsRef<str>) -> Result<()> {
         let key = key.as_ref();
-        let _guard = self.gate.write().await;
+        let _clear_guard = self.clear_gate.read().await;
+        let key_lock = self.key_lock(key).await;
+        let _key_guard = key_lock.lock().await;
         self.memory.invalidate(key).await;
         self.storage.remove(key).await
     }
 
     /// Clears both cache tiers.
     pub async fn clear(&self) -> Result<()> {
-        let _guard = self.gate.write().await;
+        let _clear_guard = self.clear_gate.write().await;
         self.memory.invalidate_all();
         self.memory.run_pending_tasks().await;
         self.storage.clear().await
     }
 
     /// Deletes expired SQLite rows and returns the number removed.
-    ///
-    /// L1 expiration is checked on every read. This explicit method leaves periodic
-    /// cleanup policy to the host application instead of creating background work.
     pub async fn purge_expired(&self) -> Result<u64> {
-        let _guard = self.gate.write().await;
+        let _clear_guard = self.clear_gate.read().await;
         self.storage
             .purge_expired(system_time_ms(SystemTime::now()))
             .await
@@ -189,8 +325,8 @@ impl Engram {
             }
             let waiting_on = {
                 let mut in_flight = self.in_flight.lock().await;
-                if let Some(notify) = in_flight.get(&key) {
-                    Some(notify.clone())
+                if let Some(flight) = in_flight.get(&key) {
+                    Some(flight.clone())
                 } else {
                     in_flight.insert(
                         key.clone(),
@@ -203,8 +339,6 @@ impl Engram {
                 }
             };
             if let Some(flight) = waiting_on {
-                // Register interest before checking completion so a notification cannot
-                // be missed between the check and the await.
                 let notified = flight.notify.clone().notified_owned();
                 if !flight.completed.load(Ordering::Acquire) {
                     notified.await;
@@ -227,6 +361,148 @@ impl Engram {
         }
     }
 
+    async fn get_arc_with_metadata<T>(&self, key: &str) -> Result<Option<(Arc<T>, CacheMetadata)>>
+    where
+        T: DeserializeOwned + Send + Sync + 'static,
+    {
+        let _clear_guard = self.clear_gate.read().await;
+        let key_lock = self.key_lock(key).await;
+        let _key_guard = key_lock.lock().await;
+        if let Some(entry) = self.memory.get(key).await {
+            if !expired(entry.expires_at) {
+                let value = downcast_arc(key, entry.value.clone(), entry.type_name)?;
+                return Ok(Some((
+                    value,
+                    CacheMetadata {
+                        expires_at: entry.expires_at,
+                        tier: CacheTier::Memory,
+                    },
+                )));
+            }
+            self.memory.invalidate(key).await;
+        }
+
+        let Some(stored) = self.storage.get(key).await? else {
+            return Ok(None);
+        };
+        if expired_ms(stored.expires_at_ms) {
+            self.storage.remove(key).await?;
+            return Ok(None);
+        }
+        if stored.type_name != type_name::<T>() {
+            return Err(Error::TypeMismatch {
+                key: key.to_owned(),
+                requested: type_name::<T>(),
+                actual: stored.type_name,
+            });
+        }
+        let bytes = compression::decode(stored.bytes, stored.encoding).await?;
+        let value = Arc::new(bincode::deserialize::<T>(&bytes).map_err(Error::Deserialize)?);
+        let expires_at = stored.expires_at_ms.map(system_time_from_ms);
+        let memory_value: Arc<dyn Any + Send + Sync> = value.clone();
+        self.memory
+            .insert(
+                key.to_owned(),
+                Arc::new(MemoryEntry {
+                    value: memory_value,
+                    type_name: type_name::<T>(),
+                    expires_at,
+                    weight: stored.memory_weight,
+                }),
+            )
+            .await;
+        Ok(Some((
+            value,
+            CacheMetadata {
+                expires_at,
+                tier: CacheTier::Persistent,
+            },
+        )))
+    }
+
+    async fn set_arc_inner<T>(
+        &self,
+        key: String,
+        value: Arc<T>,
+        ttl: Option<Duration>,
+        weight: Option<u32>,
+    ) -> Result<()>
+    where
+        T: Serialize + Send + Sync + 'static,
+    {
+        let pending = self.prepare_write(key.clone(), value, ttl, weight).await?;
+        let _clear_guard = self.clear_gate.read().await;
+        let key_lock = self.key_lock(&key).await;
+        let _key_guard = key_lock.lock().await;
+        self.insert_memory(&pending).await;
+        if let Err(error) = self.storage.set(&pending.write).await {
+            self.memory.invalidate(&key).await;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn prepare_write<T>(
+        &self,
+        key: String,
+        value: Arc<T>,
+        ttl: Option<Duration>,
+        requested_weight: Option<u32>,
+    ) -> Result<PendingWrite>
+    where
+        T: Serialize + Send + Sync + 'static,
+    {
+        let serialized = bincode::serialize(value.as_ref()).map_err(Error::Serialize)?;
+        let weight = requested_weight
+            .unwrap_or_else(|| cache_weight(serialized.len()))
+            .max(1);
+        let (bytes, encoding) = compression::encode(
+            serialized,
+            &self.compression,
+            self.compression_threshold,
+            self.compress_only_if_smaller,
+        )
+        .await?;
+        let expires_at = ttl.map(|ttl| SystemTime::now() + ttl);
+        let memory_value: Arc<dyn Any + Send + Sync> = value;
+        Ok(PendingWrite {
+            write: StoredWrite {
+                key,
+                bytes,
+                expires_at_ms: expires_at.map(system_time_ms),
+                encoding,
+                type_name: type_name::<T>(),
+                memory_weight: weight,
+                created_at_ms: system_time_ms(SystemTime::now()),
+            },
+            value: memory_value,
+            expires_at,
+        })
+    }
+
+    async fn insert_memory(&self, pending: &PendingWrite) {
+        let entry = Arc::new(MemoryEntry {
+            value: pending.value.clone(),
+            type_name: pending.write.type_name,
+            expires_at: pending.expires_at,
+            weight: pending.write.memory_weight,
+        });
+        self.memory.insert(pending.write.key.clone(), entry).await;
+    }
+
+    async fn key_lock(&self, key: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.key_locks.lock().await;
+        if locks.len() >= 1024 {
+            locks.retain(|_, lock| lock.strong_count() > 0);
+        }
+        if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(key.to_owned(), Arc::downgrade(&lock));
+        lock
+    }
+
     async fn finish_initialization(&self, key: &str) {
         if let Some(flight) = self.in_flight.lock().await.remove(key) {
             flight.completed.store(true, Ordering::Release);
@@ -235,22 +511,39 @@ impl Engram {
     }
 }
 
-fn downcast_value<T>(
+fn spawn_expiry_cleaner(
+    storage: Weak<SqliteStore>,
+    clear_gate: Weak<RwLock<()>>,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            let (Some(storage), Some(clear_gate)) = (storage.upgrade(), clear_gate.upgrade())
+            else {
+                return;
+            };
+            let _clear_guard = clear_gate.read().await;
+            let _ = storage
+                .purge_expired(system_time_ms(SystemTime::now()))
+                .await;
+        }
+    });
+}
+
+fn downcast_arc<T>(
     key: &str,
     value: Arc<dyn Any + Send + Sync>,
     actual: &'static str,
-) -> Result<Option<T>>
+) -> Result<Arc<T>>
 where
-    T: Clone + Send + Sync + 'static,
+    T: Send + Sync + 'static,
 {
-    match value.downcast::<T>() {
-        Ok(value) => Ok(Some((*value).clone())),
-        Err(_) => Err(Error::TypeMismatch {
-            key: key.to_owned(),
-            requested: type_name::<T>(),
-            actual: actual.to_owned(),
-        }),
-    }
+    value.downcast::<T>().map_err(|_| Error::TypeMismatch {
+        key: key.to_owned(),
+        requested: type_name::<T>(),
+        actual: actual.to_owned(),
+    })
 }
 
 fn cache_weight(serialized_len: usize) -> u32 {
@@ -293,7 +586,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn l1_hit_needs_no_persistent_row() {
+    async fn l1_hit_does_not_need_a_persistent_row() {
         let directory = TempDir::new().unwrap();
         let cache = cache(&directory, 1_024).await;
         cache
@@ -308,7 +601,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn l2_hit_promotes_back_to_l1() {
+    async fn l2_hit_promotes_an_entry_back_to_l1() {
         let directory = TempDir::new().unwrap();
         let cache = cache(&directory, 1_024).await;
         cache.set("key", &99_u64, None).await.unwrap();
@@ -319,9 +612,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn l1_eviction_does_not_delete_l2() {
+    async fn l1_eviction_never_removes_l2() {
         let directory = TempDir::new().unwrap();
-        // Both values are larger than this L1 capacity and therefore evicted by Moka.
+        // Each value exceeds L1's capacity and is evicted by Moka.
         let cache = cache(&directory, 1).await;
         cache
             .set("first", &"first entry".to_owned(), None)
@@ -336,22 +629,5 @@ mod tests {
             cache.get::<String>("first").await.unwrap(),
             Some("first entry".to_owned())
         );
-    }
-
-    #[tokio::test]
-    async fn purging_expired_rows_reports_deletions() {
-        let directory = TempDir::new().unwrap();
-        let cache = cache(&directory, 1_024).await;
-        cache
-            .set(
-                "expired",
-                &"value".to_owned(),
-                Some(Duration::from_millis(1)),
-            )
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert_eq!(cache.purge_expired().await.unwrap(), 1);
-        assert_eq!(cache.get::<String>("expired").await.unwrap(), None);
     }
 }

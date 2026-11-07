@@ -3,16 +3,29 @@ use crate::{Compression, Error, Result};
 pub(crate) const RAW: i64 = 0;
 pub(crate) const ZSTD: i64 = 1;
 
-pub(crate) async fn encode(bytes: Vec<u8>, compression: &Compression) -> Result<(Vec<u8>, i64)> {
+pub(crate) async fn encode(
+    bytes: Vec<u8>,
+    compression: &Compression,
+    threshold: usize,
+    only_if_smaller: bool,
+) -> Result<(Vec<u8>, i64)> {
     match compression {
         Compression::Disabled => Ok((bytes, RAW)),
+        Compression::Zstd { .. } if bytes.len() < threshold => Ok((bytes, RAW)),
         Compression::Zstd { level } => {
             let level = *level;
-            let compressed =
-                tokio::task::spawn_blocking(move || zstd::stream::encode_all(&bytes[..], level))
-                    .await?
-                    .map_err(Error::Compression)?;
-            Ok((compressed, ZSTD))
+            let original = bytes;
+            let (original, compressed) = tokio::task::spawn_blocking(move || {
+                zstd::stream::encode_all(&original[..], level)
+                    .map(|compressed| (original, compressed))
+            })
+            .await?
+            .map_err(Error::Compression)?;
+            if only_if_smaller && compressed.len() >= original.len() {
+                Ok((original, RAW))
+            } else {
+                Ok((compressed, ZSTD))
+            }
         }
     }
 }

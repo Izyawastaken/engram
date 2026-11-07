@@ -10,6 +10,6 @@ mod error;
 mod memory;
 mod storage;
 
-pub use config::{Compression, EngramBuilder};
-pub use engine::Engram;
+pub use config::{Compression, EngramBuilder, SqliteSynchronous};
+pub use engine::{CacheEntry, CacheMetadata, CacheTier, Engram};
 pub use error::{Error, Result};

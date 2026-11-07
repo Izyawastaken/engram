@@ -127,6 +127,51 @@ async fn concurrent_writes_remain_readable() {
 }
 
 #[tokio::test]
+async fn metadata_exposes_expiry_and_permanent_entries() {
+    let directory = TempDir::new().unwrap();
+    let cache = cache(&directory).await;
+    cache.set("permanent", &1_u64, None).await.unwrap();
+    let permanent = cache.metadata("permanent").await.unwrap().unwrap();
+    assert_eq!(permanent.tier, engram::CacheTier::Memory);
+    assert_eq!(permanent.expires_at, None);
+    assert_eq!(permanent.remaining_ttl(), None);
+
+    cache
+        .set("temporary", &2_u64, Some(Duration::from_secs(5)))
+        .await
+        .unwrap();
+    let temporary = cache
+        .get_with_metadata::<u64>("temporary")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(temporary.metadata.expires_at.is_some());
+    assert!(temporary.metadata.remaining_ttl().is_some());
+}
+
+#[tokio::test]
+async fn arc_and_batch_apis_avoid_extra_value_copies_and_persist() {
+    let directory = TempDir::new().unwrap();
+    let cache = cache(&directory).await;
+    let source = Arc::new(vec![7_u8; 8 * 1024]);
+    cache.set_arc("shared", source.clone(), None).await.unwrap();
+    let retrieved = cache.get_arc::<Vec<u8>>("shared").await.unwrap().unwrap();
+    assert!(Arc::ptr_eq(&source, &retrieved));
+
+    cache
+        .set_many([("one", 1_u64), ("two", 2_u64)], None)
+        .await
+        .unwrap();
+    assert_eq!(cache.get::<u64>("one").await.unwrap(), Some(1));
+    assert_eq!(cache.get::<u64>("two").await.unwrap(), Some(2));
+    cache
+        .set_with_weight("weighted", &3_u64, None, 1)
+        .await
+        .unwrap();
+    assert_eq!(cache.get::<u64>("weighted").await.unwrap(), Some(3));
+}
+
+#[tokio::test]
 async fn invalid_database_path_surfaces_sqlite_error() {
     let directory = TempDir::new().unwrap();
     let result = Engram::builder()
