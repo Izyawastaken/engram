@@ -8,9 +8,10 @@ pub(crate) async fn encode(bytes: Vec<u8>, compression: &Compression) -> Result<
         Compression::Disabled => Ok((bytes, RAW)),
         Compression::Zstd { level } => {
             let level = *level;
-            let compressed = tokio::task::spawn_blocking(move || zstd::stream::encode_all(&bytes[..], level))
-                .await?
-                .map_err(Error::Compression)?;
+            let compressed =
+                tokio::task::spawn_blocking(move || zstd::stream::encode_all(&bytes[..], level))
+                    .await?
+                    .map_err(Error::Compression)?;
             Ok((compressed, ZSTD))
         }
     }

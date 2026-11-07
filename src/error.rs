@@ -15,7 +15,7 @@ pub enum Error {
     TypeMismatch {
         key: String,
         requested: &'static str,
-        actual: &'static str,
+        actual: String,
     },
     #[error("background compression task failed: {0}")]
     BackgroundTask(#[from] tokio::task::JoinError),
