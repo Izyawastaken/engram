@@ -198,8 +198,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "engram"
-version = "0.1.0"
+name = "engram-cache"
+version = "0.1.1"
 dependencies = [
  "bincode",
  "moka",

@@ -4,7 +4,7 @@ use moka::future::Cache;
 
 pub(crate) struct MemoryEntry {
     pub(crate) value: Arc<dyn Any + Send + Sync>,
-    pub(crate) type_name: &'static str,
+    pub(crate) type_name: String,
     pub(crate) expires_at: Option<SystemTime>,
     pub(crate) weight: u32,
 }

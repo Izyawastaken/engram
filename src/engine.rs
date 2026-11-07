@@ -2,6 +2,7 @@ use std::{
     any::{type_name, Any},
     collections::HashMap,
     future::Future,
+    marker::PhantomData,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Weak,
@@ -49,6 +50,39 @@ impl CacheMetadata {
 pub struct CacheEntry<T> {
     pub value: T,
     pub metadata: CacheMetadata,
+}
+
+/// A cache key with a caller-controlled, stable schema tag.
+///
+/// Use this when values are intended to survive releases. Keep `schema` stable
+/// across Rust type/module renames, and change it when the serialized format is
+/// intentionally incompatible.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct CacheKey<T> {
+    key: String,
+    schema: String,
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<T> CacheKey<T> {
+    /// Creates a key with a durable, application-defined schema tag.
+    pub fn new(key: impl Into<String>, schema: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            schema: schema.into(),
+            marker: PhantomData,
+        }
+    }
+
+    /// The storage key.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// The application-defined schema tag persisted with this key.
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
 }
 
 /// A reusable asynchronous cache with Moka memory and SQLite persistence tiers.
@@ -119,7 +153,18 @@ impl Engram {
         T: DeserializeOwned + Clone + Send + Sync + 'static,
     {
         Ok(self
-            .get_arc_with_metadata::<T>(key.as_ref())
+            .get_arc_with_metadata::<T>(key.as_ref(), type_name::<T>())
+            .await?
+            .map(|(value, _)| (*value).clone()))
+    }
+
+    /// Retrieves a value using a caller-controlled schema tag.
+    pub async fn get_key<T>(&self, key: &CacheKey<T>) -> Result<Option<T>>
+    where
+        T: DeserializeOwned + Clone + Send + Sync + 'static,
+    {
+        Ok(self
+            .get_arc_with_metadata::<T>(key.key(), key.schema())
             .await?
             .map(|(value, _)| (*value).clone()))
     }
@@ -130,7 +175,21 @@ impl Engram {
         T: DeserializeOwned + Clone + Send + Sync + 'static,
     {
         Ok(self
-            .get_arc_with_metadata::<T>(key.as_ref())
+            .get_arc_with_metadata::<T>(key.as_ref(), type_name::<T>())
+            .await?
+            .map(|(value, metadata)| CacheEntry {
+                value: (*value).clone(),
+                metadata,
+            }))
+    }
+
+    /// Retrieves a value and metadata using a caller-controlled schema tag.
+    pub async fn get_key_with_metadata<T>(&self, key: &CacheKey<T>) -> Result<Option<CacheEntry<T>>>
+    where
+        T: DeserializeOwned + Clone + Send + Sync + 'static,
+    {
+        Ok(self
+            .get_arc_with_metadata::<T>(key.key(), key.schema())
             .await?
             .map(|(value, metadata)| CacheEntry {
                 value: (*value).clone(),
@@ -144,7 +203,18 @@ impl Engram {
         T: DeserializeOwned + Send + Sync + 'static,
     {
         Ok(self
-            .get_arc_with_metadata::<T>(key.as_ref())
+            .get_arc_with_metadata::<T>(key.as_ref(), type_name::<T>())
+            .await?
+            .map(|(value, _)| value))
+    }
+
+    /// Retrieves a shared value using a caller-controlled schema tag.
+    pub async fn get_arc_key<T>(&self, key: &CacheKey<T>) -> Result<Option<Arc<T>>>
+    where
+        T: DeserializeOwned + Send + Sync + 'static,
+    {
+        Ok(self
+            .get_arc_with_metadata::<T>(key.key(), key.schema())
             .await?
             .map(|(value, _)| value))
     }
@@ -195,8 +265,47 @@ impl Engram {
     where
         T: Serialize + Send + Sync + 'static,
     {
-        self.set_arc_inner(key.as_ref().to_owned(), value, ttl, None)
-            .await
+        self.set_arc_inner(
+            key.as_ref().to_owned(),
+            value,
+            ttl,
+            None,
+            type_name::<T>().to_owned(),
+        )
+        .await
+    }
+
+    /// Stores a value with a caller-controlled schema tag.
+    pub async fn set_key<T>(
+        &self,
+        key: &CacheKey<T>,
+        value: &T,
+        ttl: Option<Duration>,
+    ) -> Result<()>
+    where
+        T: Serialize + Clone + Send + Sync + 'static,
+    {
+        self.set_arc_key(key, Arc::new(value.clone()), ttl).await
+    }
+
+    /// Stores a shared value with a caller-controlled schema tag.
+    pub async fn set_arc_key<T>(
+        &self,
+        key: &CacheKey<T>,
+        value: Arc<T>,
+        ttl: Option<Duration>,
+    ) -> Result<()>
+    where
+        T: Serialize + Send + Sync + 'static,
+    {
+        self.set_arc_inner(
+            key.key().to_owned(),
+            value,
+            ttl,
+            None,
+            key.schema().to_owned(),
+        )
+        .await
     }
 
     /// Stores a value with an explicit L1 weight, useful when serialized size is not
@@ -216,6 +325,7 @@ impl Engram {
             Arc::new(value.clone()),
             ttl,
             Some(weight),
+            type_name::<T>().to_owned(),
         )
         .await
     }
@@ -231,8 +341,14 @@ impl Engram {
     where
         T: Serialize + Send + Sync + 'static,
     {
-        self.set_arc_inner(key.as_ref().to_owned(), value, ttl, Some(weight))
-            .await
+        self.set_arc_inner(
+            key.as_ref().to_owned(),
+            value,
+            ttl,
+            Some(weight),
+            type_name::<T>().to_owned(),
+        )
+        .await
     }
 
     /// Persists many values in one SQLite transaction.
@@ -245,8 +361,14 @@ impl Engram {
         let mut pending = Vec::new();
         for (key, value) in values {
             pending.push(
-                self.prepare_write(key.into(), Arc::new(value), ttl, None)
-                    .await?,
+                self.prepare_write(
+                    key.into(),
+                    Arc::new(value),
+                    ttl,
+                    None,
+                    type_name::<T>().to_owned(),
+                )
+                .await?,
             );
         }
         if pending.is_empty() {
@@ -265,15 +387,13 @@ impl Engram {
             _key_guards.push(self.key_lock(key).await.lock_owned().await);
         }
 
+        let writes: Vec<StoredWrite> = pending
+            .iter()
+            .map(|pending| pending.write.clone())
+            .collect();
+        self.storage.set_many(&writes).await?;
         for pending_write in &pending {
             self.insert_memory(pending_write).await;
-        }
-        let writes: Vec<StoredWrite> = pending.into_iter().map(|pending| pending.write).collect();
-        if let Err(error) = self.storage.set_many(&writes).await {
-            for key in &keys {
-                self.memory.invalidate(key).await;
-            }
-            return Err(error);
         }
         Ok(())
     }
@@ -361,7 +481,11 @@ impl Engram {
         }
     }
 
-    async fn get_arc_with_metadata<T>(&self, key: &str) -> Result<Option<(Arc<T>, CacheMetadata)>>
+    async fn get_arc_with_metadata<T>(
+        &self,
+        key: &str,
+        type_tag: &str,
+    ) -> Result<Option<(Arc<T>, CacheMetadata)>>
     where
         T: DeserializeOwned + Send + Sync + 'static,
     {
@@ -370,7 +494,14 @@ impl Engram {
         let _key_guard = key_lock.lock().await;
         if let Some(entry) = self.memory.get(key).await {
             if !expired(entry.expires_at) {
-                let value = downcast_arc(key, entry.value.clone(), entry.type_name)?;
+                if entry.type_name != type_tag {
+                    return Err(Error::TypeMismatch {
+                        key: key.to_owned(),
+                        requested: type_tag.to_owned(),
+                        actual: entry.type_name.clone(),
+                    });
+                }
+                let value = downcast_arc(key, entry.value.clone(), &entry.type_name)?;
                 return Ok(Some((
                     value,
                     CacheMetadata {
@@ -389,10 +520,10 @@ impl Engram {
             self.storage.remove(key).await?;
             return Ok(None);
         }
-        if stored.type_name != type_name::<T>() {
+        if stored.type_name != type_tag {
             return Err(Error::TypeMismatch {
                 key: key.to_owned(),
-                requested: type_name::<T>(),
+                requested: type_tag.to_owned(),
                 actual: stored.type_name,
             });
         }
@@ -405,7 +536,7 @@ impl Engram {
                 key.to_owned(),
                 Arc::new(MemoryEntry {
                     value: memory_value,
-                    type_name: type_name::<T>(),
+                    type_name: type_tag.to_owned(),
                     expires_at,
                     weight: stored.memory_weight,
                 }),
@@ -426,11 +557,14 @@ impl Engram {
         value: Arc<T>,
         ttl: Option<Duration>,
         weight: Option<u32>,
+        type_tag: String,
     ) -> Result<()>
     where
         T: Serialize + Send + Sync + 'static,
     {
-        let pending = self.prepare_write(key.clone(), value, ttl, weight).await?;
+        let pending = self
+            .prepare_write(key.clone(), value, ttl, weight, type_tag)
+            .await?;
         let _clear_guard = self.clear_gate.read().await;
         let key_lock = self.key_lock(&key).await;
         let _key_guard = key_lock.lock().await;
@@ -448,6 +582,7 @@ impl Engram {
         value: Arc<T>,
         ttl: Option<Duration>,
         requested_weight: Option<u32>,
+        type_tag: String,
     ) -> Result<PendingWrite>
     where
         T: Serialize + Send + Sync + 'static,
@@ -471,7 +606,7 @@ impl Engram {
                 bytes,
                 expires_at_ms: expires_at.map(system_time_ms),
                 encoding,
-                type_name: type_name::<T>(),
+                type_name: type_tag,
                 memory_weight: weight,
                 created_at_ms: system_time_ms(SystemTime::now()),
             },
@@ -483,7 +618,7 @@ impl Engram {
     async fn insert_memory(&self, pending: &PendingWrite) {
         let entry = Arc::new(MemoryEntry {
             value: pending.value.clone(),
-            type_name: pending.write.type_name,
+            type_name: pending.write.type_name.clone(),
             expires_at: pending.expires_at,
             weight: pending.write.memory_weight,
         });
@@ -531,17 +666,13 @@ fn spawn_expiry_cleaner(
     });
 }
 
-fn downcast_arc<T>(
-    key: &str,
-    value: Arc<dyn Any + Send + Sync>,
-    actual: &'static str,
-) -> Result<Arc<T>>
+fn downcast_arc<T>(key: &str, value: Arc<dyn Any + Send + Sync>, actual: &str) -> Result<Arc<T>>
 where
     T: Send + Sync + 'static,
 {
     value.downcast::<T>().map_err(|_| Error::TypeMismatch {
         key: key.to_owned(),
-        requested: type_name::<T>(),
+        requested: type_name::<T>().to_owned(),
         actual: actual.to_owned(),
     })
 }
@@ -629,5 +760,47 @@ mod tests {
             cache.get::<String>("first").await.unwrap(),
             Some("first entry".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn clear_waits_for_an_active_key_operation() {
+        let directory = TempDir::new().unwrap();
+        let cache = cache(&directory, 1_024).await;
+        let clear_read_guard = cache.clear_gate.read().await;
+        let key_lock = cache.key_lock("promoting").await;
+        let key_guard = key_lock.lock().await;
+        let clearing_cache = cache.clone();
+        let clearing = tokio::spawn(async move { clearing_cache.clear().await });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !clearing.is_finished(),
+            "clear must wait until the operation-wide gate is released"
+        );
+
+        drop(key_guard);
+        drop(clear_read_guard);
+        clearing.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_batch_does_not_partially_update_l1() {
+        let directory = TempDir::new().unwrap();
+        let cache = cache(&directory, 1_024).await;
+        cache.set("good", &"old".to_owned(), None).await.unwrap();
+        cache.storage.abort_writes_for_test().await.unwrap();
+
+        assert!(cache
+            .set_many(
+                [("good", "new".to_owned()), ("bad", "new".to_owned())],
+                None,
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            cache.get::<String>("good").await.unwrap(),
+            Some("old".to_owned())
+        );
+        assert_eq!(cache.get::<String>("bad").await.unwrap(), None);
     }
 }

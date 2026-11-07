@@ -15,12 +15,13 @@ pub(crate) struct StoredEntry {
     pub(crate) memory_weight: u32,
 }
 
+#[derive(Clone)]
 pub(crate) struct StoredWrite {
     pub(crate) key: String,
     pub(crate) bytes: Vec<u8>,
     pub(crate) expires_at_ms: Option<i64>,
     pub(crate) encoding: i64,
-    pub(crate) type_name: &'static str,
+    pub(crate) type_name: String,
     pub(crate) memory_weight: u32,
     pub(crate) created_at_ms: i64,
 }
@@ -142,7 +143,7 @@ impl SqliteStore {
         .bind(&write.bytes)
         .bind(write.expires_at_ms)
         .bind(write.encoding)
-        .bind(write.type_name)
+        .bind(&write.type_name)
         .bind(i64::from(write.memory_weight))
         .bind(write.created_at_ms)
         .execute(executor)
@@ -173,5 +174,17 @@ impl SqliteStore {
         .execute(&self.pool)
         .await?
         .rows_affected())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn abort_writes_for_test(&self) -> Result<()> {
+        sqlx::query(
+            "CREATE TRIGGER engram_abort_write_for_test
+             BEFORE INSERT ON engram_entries
+             BEGIN SELECT RAISE(ABORT, 'forced batch failure'); END",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }

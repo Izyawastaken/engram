@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use engram::{Compression, Engram};
+use engram::{CacheKey, Compression, Engram};
 use tempfile::TempDir;
 
 async fn cache(directory: &TempDir) -> Engram {
@@ -179,4 +179,19 @@ async fn invalid_database_path_surfaces_sqlite_error() {
         .build()
         .await;
     assert!(matches!(result, Err(engram::Error::Sqlite(_))));
+}
+
+#[tokio::test]
+async fn caller_controlled_schema_tags_survive_type_name_changes() {
+    let directory = TempDir::new().unwrap();
+    let cache = cache(&directory).await;
+    let v1 = CacheKey::<u64>::new("project:1", "project-record@1");
+    cache.set_key(&v1, &42, None).await.unwrap();
+
+    assert_eq!(cache.get_key(&v1).await.unwrap(), Some(42));
+    let incompatible = CacheKey::<u64>::new("project:1", "project-record@2");
+    assert!(matches!(
+        cache.get_key(&incompatible).await,
+        Err(engram::Error::TypeMismatch { .. })
+    ));
 }

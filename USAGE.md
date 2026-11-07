@@ -1,12 +1,12 @@
 # Using Engram
 
-Engram is an async, application-independent cache. It keeps deserialized values in Moka (L1) and persists Serde-serialized, optionally Zstandard-compressed values in SQLite (L2). Successful writes always reach L2.
+Engram is an async, application-independent cache. It keeps deserialized values in Moka (L1) and persists Serde-serialized, optionally Zstandard-compressed values in SQLite (L2). A successful write has committed its SQLite transaction to the WAL. The default `SqliteSynchronous::Full` asks SQLite for its strongest sync behavior; `Normal` is faster but a recent commit may be lost after a power failure or OS crash.
 
 ## Setup
 
 ```toml
 [dependencies]
-engram = "0.1"
+engram = { package = "engram-cache", version = "0.1" }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
@@ -103,6 +103,8 @@ cache.set_many(
 # Ok::<(), engram::Error>(())
 ```
 
+`set_many` locks its keys in sorted order and only updates L1 after that transaction commits. If the transaction fails, neither tier is changed by the batch.
+
 L1 capacity is weighted by serialized byte length by default. When that does not approximate an object’s resident memory cost, provide an explicit weight; it is persisted and reused when the entry is restored from L2.
 
 ```rust
@@ -127,6 +129,23 @@ let project: Project = cache
 ## Operational notes
 
 - SQLite uses WAL mode, a five-second busy timeout, and a partial expiry index.
-- Unrelated keys can read and write concurrently; operations on one key are serialized so invalidated L2 data cannot revive L1.
-- A key is associated with its Rust type. A mismatched type returns `Error::TypeMismatch` instead of decoding incompatible bytes. Use new keys or clear the cache when changing a cached type across releases.
+- Unrelated keys can read and write concurrently; operations on one key are serialized. `clear` obtains an operation-wide write gate, so it waits for an in-flight L2-to-L1 promotion and blocks new operations until both tiers are empty.
+- String-key APIs use Rust's `type_name::<T>()` as the stored type tag. That protects against decoding the wrong in-process type, but a type rename or module move changes the tag. For persisted values that must survive releases, use `CacheKey` with an application-defined schema tag and only change that tag for an intentionally incompatible serialized format.
 - `remove` deletes both tiers; `clear` deletes both tiers globally.
+
+## Stable schema tags
+
+`CacheKey<T>` separates the storage key from the stable schema identifier. This avoids tying durable cache compatibility to a Rust module path. The schema string is stored in L2 and also checked in L1.
+
+```rust
+use engram::CacheKey;
+
+let project_key = CacheKey::<Project>::new("project:123", "modrinth-project@1");
+cache.set_key(&project_key, &project, None).await?;
+let cached: Option<Project> = cache.get_key(&project_key).await?;
+
+// After an incompatible serialization change, use a new tag. Existing bytes
+// return Error::TypeMismatch instead of being decoded as the new layout.
+let next_project_key = CacheKey::<Project>::new("project:123", "modrinth-project@2");
+# Ok::<(), engram::Error>(())
+```

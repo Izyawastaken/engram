@@ -1,9 +1,20 @@
 [package]
-name = "engram"
-version = "0.1.0"
+name = "engram-cache"
+version = "0.1.1"
 edition = "2021"
 description = "An asynchronous, multi-tier cache backed by Moka and SQLite"
 license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/Izyawastaken/engram"
+documentation = "https://docs.rs/engram-cache"
+homepage = "https://github.com/Izyawastaken/engram"
+keywords = ["cache", "sqlite", "moka", "async", "zstd"]
+categories = ["asynchronous", "caching", "database"]
+rust-version = "1.70"
+exclude = ["demo/**"]
+
+[lib]
+name = "engram"
 
 [dependencies]
 bincode = "1.3"

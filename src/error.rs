@@ -14,7 +14,7 @@ pub enum Error {
     #[error("cached value for key `{key}` has type `{actual}`, not requested type `{requested}`")]
     TypeMismatch {
         key: String,
-        requested: &'static str,
+        requested: String,
         actual: String,
     },
     #[error("background compression task failed: {0}")]
