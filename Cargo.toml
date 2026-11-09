@@ -1,6 +1,6 @@
 [package]
 name = "engram-cache"
-version = "0.1.1"
+version = "0.2.5"
 edition = "2021"
 description = "An asynchronous, multi-tier cache backed by Moka and SQLite"
 license = "MIT OR Apache-2.0"
@@ -26,5 +26,6 @@ tokio = { version = "1", features = ["rt", "sync", "time"] }
 zstd = "0.13"
 
 [dev-dependencies]
+proptest = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

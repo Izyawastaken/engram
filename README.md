@@ -8,6 +8,8 @@ Engram is an asynchronous Rust cache with a deserialized Moka L1 and a SQLite WA
 - Moka L1 stores deserialized `Arc` values; SQLite L2 stores serialized blobs.
 - Optional Zstandard compression, TTLs, permanent entries, expiry cleanup, and weighted memory capacity.
 - Per-key serialization, transactional `set_many`, global `clear` exclusion, and fetch-through single-flight initialization.
+- Generic V1 validation and R1 retrieval through consumer-defined source adapters, including durable ETag/custom validators and stale-on-outage policy.
+- Optimistic V1/R1 commits, namespace-level policies, process-local cache metrics, and optional buffered SQLite group commits.
 - `CacheKey<T>` supplies a stable application-defined schema tag for cache entries that survive Rust refactors.
 
 ```rust,no_run

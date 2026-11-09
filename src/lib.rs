@@ -99,17 +99,87 @@
 //! A mismatched tag returns [`Error::TypeMismatch`] rather than attempting to
 //! decode the bytes. The same tag is checked in both L1 and L2.
 //!
+//! ## V1 validation and R1 retrieval
+//!
+//! Implement [`Source<T>`] to connect Engram to an origin. The adapter owns the
+//! transport and protocol; it can use HTTP conditional requests with the
+//! retained [`ValidationMetadata`], a filesystem, object storage, or an
+//! application backend. V1 returns [`ValidationOutcome`] and R1 returns
+//! [`RetrievalOutcome`], so a network outage, an unknown resource, and an
+//! invalid representation remain distinguishable.
+//!
+//! ```no_run
+//! use engram::{
+//!     CacheKey, Engram, ResolveOptions, Source, SourceFuture, ValidationOutcome,
+//!     ValidationRequest, RetrievalOutcome, RetrievalRequest,
+//! };
+//! use serde::{Deserialize, Serialize};
+//!
+//! #[derive(Clone, Deserialize, Serialize)]
+//! struct Project { id: u64 }
+//!
+//! struct ProjectSource;
+//!
+//! impl Source<Project> for ProjectSource {
+//!     type Error = std::io::Error;
+//!
+//!     fn validate<'a>(
+//!         &'a self,
+//!         request: ValidationRequest<'a, Project>,
+//!     ) -> SourceFuture<'a, Result<ValidationOutcome, Self::Error>> {
+//!         Box::pin(async move {
+//!             // Send If-None-Match using request.validation.and_then(|v| v.etag.as_ref()).
+//!             let _ = request;
+//!             Ok(ValidationOutcome::Fresh { validation: None })
+//!         })
+//!     }
+//!
+//!     fn retrieve<'a>(
+//!         &'a self,
+//!         request: RetrievalRequest<'a>,
+//!     ) -> SourceFuture<'a, Result<RetrievalOutcome<Project>, Self::Error>> {
+//!         Box::pin(async move {
+//!             let _ = request;
+//!             Ok(RetrievalOutcome::NotFound)
+//!         })
+//!     }
+//! }
+//!
+//! # async fn example(cache: Engram) -> Result<(), Box<dyn std::error::Error>> {
+//! let key = CacheKey::<Project>::new("project:123", "project-record@1");
+//! let source = ProjectSource;
+//! let resolved = cache.resolve(&key, ResolveOptions::default(), &source).await?;
+//! # let _ = resolved;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! On a cache miss R1 always runs. For an existing value, set
+//! [`ResolveOptions::validation`] to [`ValidationPolicy::Always`] or
+//! [`ValidationPolicy::After`] to opt into V1. An unavailable origin never
+//! deletes cached data; [`ResolveOptions::serve_stale_on_unavailable`] decides
+//! whether the value is returned with [`ResolveStatus::StaleUnavailable`] or
+//! an error. Similarly, [`ResolveOptions::retrieve_on_unverifiable`] controls
+//! whether an unknown freshness result triggers R1.
+//!
 //! ## Concurrency and fetch-through
 //!
-//! Operations for one key are serialized, while unrelated keys can proceed in
-//! parallel. Bulk writes acquire their key locks in sorted order, avoiding
-//! deadlock between overlapping batches. [`Engram::clear`] takes a global
-//! write gate: it waits for active operations, including L2-to-L1 promotions,
-//! and prevents new operations until both tiers are cleared.
+//! Reads and origin I/O do not keep a per-key write lock. Concurrent V1/R1
+//! resolutions for the same key coalesce, while a generation check ensures a
+//! late origin response cannot overwrite a newer `set`, `remove`, or `clear`.
+//! The short snapshot and commit sections are protected per key. Bulk writes
+//! acquire their key locks in sorted order, avoiding deadlock between
+//! overlapping batches. [`Engram::clear`] takes a global write gate for those
+//! short sections; an in-flight source response observes the new generation
+//! and returns [`ResolveError::Conflict`] rather than resurrecting cleared
+//! data. Cancellation and source panics also release their single-flight slot.
 //!
 //! [`Engram::get_or_try_init`] is an opt-in fetch-through helper. It invokes
 //! the initializer only after a miss and coalesces simultaneous
 //! initializations for the same key. Initializer errors are not cached.
+//! [`Engram::resolve_in_background`] runs the V1/R1 pipeline in a task for
+//! prefetching or non-blocking revalidation; abort its returned join handle
+//! when the work is no longer useful.
 //!
 //! ## Durability and performance
 //!
@@ -127,6 +197,15 @@
 //! [`Engram::set_arc_with_weight`] to provide a more representative memory
 //! cost.
 //!
+//! [`Engram::set_buffered`] makes the L1 result visible immediately and queues
+//! its L2 write for one background writer, which combines writes into SQLite
+//! transactions. Call [`Engram::flush`] before a controlled shutdown when
+//! buffered persistence must be drained. Pending buffered writes overlay both
+//! cache tiers, so reads retain read-your-writes behavior even after L1
+//! eviction. [`Engram::namespace`] packages a
+//! stable schema tag and V1/R1 policy for a key family, and
+//! [`Engram::metrics`] exposes per-tier hit and latency counters for monitoring.
+//!
 //! [Moka]: https://docs.rs/moka
 
 mod compression;
@@ -134,8 +213,17 @@ mod config;
 mod engine;
 mod error;
 mod memory;
+mod metrics;
+mod source;
 mod storage;
+mod writer;
 
-pub use config::{Compression, EngramBuilder, SqliteSynchronous};
+pub use config::{Compression, EngramBuilder, SqliteSynchronous, WriteDurability};
 pub use engine::{CacheEntry, CacheKey, CacheMetadata, CacheTier, Engram};
 pub use error::{Error, Result};
+pub use metrics::CacheMetrics;
+pub use source::{
+    Namespace, NamespaceConfig, ResolveError, ResolveOptions, ResolveResult, ResolveStatus,
+    RetrievalOutcome, RetrievalReason, RetrievalRequest, Retrieved, Source, SourceFuture,
+    ValidationMetadata, ValidationOutcome, ValidationPolicy, ValidationRequest,
+};

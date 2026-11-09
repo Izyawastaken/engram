@@ -19,6 +19,8 @@ pub enum Error {
     },
     #[error("background compression task failed: {0}")]
     BackgroundTask(#[from] tokio::task::JoinError),
+    #[error("buffered SQLite write failed: {0}")]
+    BufferedWrite(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

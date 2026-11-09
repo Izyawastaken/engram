@@ -38,6 +38,17 @@ impl SqliteSynchronous {
     }
 }
 
+/// When a write becomes durable in SQLite.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WriteDurability {
+    /// Wait for the SQLite transaction to commit before returning. This is the default.
+    #[default]
+    Synchronous,
+    /// Update L1 immediately and group the L2 write with other buffered writes.
+    /// Call [`crate::Engram::flush`] before shutdown or when persistence is required.
+    Buffered,
+}
+
 /// Builds an [`crate::Engram`] instance.
 #[derive(Clone, Debug)]
 pub struct EngramBuilder {
@@ -49,6 +60,7 @@ pub struct EngramBuilder {
     pub(crate) sqlite_connections: u32,
     pub(crate) sqlite_synchronous: SqliteSynchronous,
     pub(crate) cleanup_interval: Option<Duration>,
+    pub(crate) write_durability: WriteDurability,
 }
 
 impl EngramBuilder {
@@ -62,6 +74,7 @@ impl EngramBuilder {
             sqlite_connections: 8,
             sqlite_synchronous: SqliteSynchronous::Full,
             cleanup_interval: None,
+            write_durability: WriteDurability::Synchronous,
         }
     }
 
@@ -104,6 +117,12 @@ impl EngramBuilder {
     /// Selects SQLite's WAL durability setting. [`SqliteSynchronous::Full`] is the default.
     pub fn sqlite_synchronous(mut self, synchronous: SqliteSynchronous) -> Self {
         self.sqlite_synchronous = synchronous;
+        self
+    }
+
+    /// Selects the default durability for ordinary `set` calls.
+    pub fn write_durability(mut self, durability: WriteDurability) -> Self {
+        self.write_durability = durability;
         self
     }
 
